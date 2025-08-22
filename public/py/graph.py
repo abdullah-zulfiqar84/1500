@@ -227,6 +227,7 @@ class Graph:
         - Normalize star edge lengths around the new vertex.
         - Apply local vertex-vertex separation and vertex-edge clearance.
         - Crossing guard; fallback to Tutte re-embed if necessary.
+        - Enhanced planarity protection for large graphs (10,000+ vertices).
         """
         per = list(self.periphery.getIndices())
         if len(per) < 3 or new_idx < 0 or new_idx >= len(self.vertices):
@@ -267,16 +268,37 @@ class Graph:
             if len(neigh) >= 4:
                 self._spread_fans(pinned=pinned, angle_min_deg=9.0, iters=1, k_frac=0.05)
 
+            # ENHANCED PLANARITY PROTECTION FOR LARGE GRAPHS
+            # For graphs with 10,000+ vertices, use more aggressive crossing detection
+            total_vertices = len(self.vertices)
+            max_reports = 3 if total_vertices >= 10000 else 1
+            cell_size = T * (0.8 if total_vertices >= 10000 else 1.0)  # Smaller cells for large graphs
+            
             # Crossing guard: if crossings remain, revert and escalate to Tutte
-            if self._has_crossings_quick(cell_size=T, max_reports=1):
+            if self._has_crossings_quick(cell_size=cell_size, max_reports=max_reports):
                 self._restore_positions(snap)
                 # Emergency fallback: guaranteed-planar layout (light polish)
-                n_interior = max(0, len(self.vertices) - len(self.periphery.getIndices()))
+                n_interior = max(0, total_vertices - len(self.periphery.getIndices()))
                 try:
-                    self.reembed_tutte(use_scipy=(n_interior > 150), final_polish=True)
+                    # For very large graphs, always use SciPy for better numerical stability
+                    use_scipy = (n_interior > 150) or (total_vertices >= 10000)
+                    self.reembed_tutte(use_scipy=use_scipy, final_polish=True)
                 except Exception:
                     self.reembed_tutte(use_scipy=False, final_polish=True)
                 return
+
+            # Additional planarity check for very large graphs
+            if total_vertices >= 10000:
+                # Double-check planarity with a more thorough scan
+                if self._has_crossings_quick(cell_size=T * 0.5, max_reports=5):
+                    self._restore_positions(snap)
+                    # Force a full Tutte re-embed for very large graphs
+                    n_interior = max(0, total_vertices - len(self.periphery.getIndices()))
+                    try:
+                        self.reembed_tutte(use_scipy=True, final_polish=True)
+                    except Exception:
+                        self.reembed_tutte(use_scipy=False, final_polish=True)
+                    return
 
             # Refresh target length from current layout (keeps median edge close to T)
             self._target_len = self._compute_target_edge_length()
@@ -2225,19 +2247,35 @@ class Graph:
         """
         Planarity-safe redraw: do a Tutte re-embed directly (guaranteed planar),
         then an optional tiny positive-weight polish.
+        Enhanced for large graphs (10,000+ vertices) with additional planarity safeguards.
         """
         per = self.periphery.getIndices()
         if len(per) < 3:
             return
 
-        # Choose SciPy for larger interior solves
-        n_interior = max(0, len(self.vertices) - len(per))
-        use_scipy = (n_interior > 150)
+        total_vertices = len(self.vertices)
+        
+        # Enhanced SciPy selection for large graphs
+        n_interior = max(0, total_vertices - len(per))
+        use_scipy = (n_interior > 150) or (total_vertices >= 10000)
 
         # Direct Tutte embed
         self.reembed_tutte(radius=radius, use_scipy=use_scipy, final_polish=True if not light else False)
+        
         # After a global re-embed, ensure no congestion remains by scaling out slightly if needed
         self._global_expand_if_congested(inflate_pad=1.02)
+        
+        # ADDITIONAL PLANARITY VERIFICATION FOR LARGE GRAPHS
+        if total_vertices >= 10000:
+            # Double-check that the redraw actually produced a planar graph
+            T = self._quick_target_length()
+            if T and T > 1e-9:
+                # Use aggressive crossing detection for large graphs
+                if self._has_crossings_quick(cell_size=T * 0.6, max_reports=10):
+                    # If crossings are detected after redraw, force another Tutte re-embed
+                    print(f"WARNING: Crossings detected after redraw in large graph ({total_vertices} vertices). Forcing re-embed.")
+                    self.reembed_tutte(radius=radius, use_scipy=True, final_polish=False)
+                    self._global_expand_if_congested(inflate_pad=1.02)
     # --------------------------
     # Normalize & recenter
     # --------------------------
