@@ -1,0 +1,8 @@
+.tt { display: inline-block; white-space: pre-wrap }
+.tt-text { display: inline-block }
+.tt-cursor { margin-left: 0.25rem; display: inline-block; opacity: 1; animation: blink 1.1s steps(2, start) infinite }
+.tt-cursor--hidden { display: none }
+
+@keyframes blink {
+  to { visibility: hidden; }
+}
