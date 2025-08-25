@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { CanvasGraph, type CanvasGraphHandle } from './components/CanvasGraph'
-import PerformanceMonitor from './components/PerformanceMonitor'
 import './styles.css'
+
 
 export default function App() {
   const graphRef = useRef<CanvasGraphHandle>(null)
@@ -9,7 +9,7 @@ export default function App() {
 
   // UI state
   const [seed, setSeed] = useState(3)
-  const [dark, setDark] = useState(false) // Default to light theme
+  const [dark, setDark] = useState(false)
   const [finalize, setFinalize] = useState(false)
   const [autoTutte, setAutoTutte] = useState(true)
   const [curved, setCurved] = useState(true)
@@ -19,25 +19,17 @@ export default function App() {
   const [goToM, setGoToM] = useState(1)
   const [stats, setStats] = useState<{ V: number, E: number, periphery: number }>({ V: 0, E: 0, periphery: 0 })
 
-  // Advanced layout controls
-  const [layoutQuality, setLayoutQuality] = useState(0)
-  const [useSpatialIndexing, setUseSpatialIndexing] = useState(true)
-  const [springK, setSpringK] = useState(0.18)
-  const [repulsionStrength, setRepulsionStrength] = useState(0.25)
-  const [magneticForces, setMagneticForces] = useState(true)
-  const [adaptiveForces, setAdaptiveForces] = useState(true)
-
   // Chip animation helpers
   const [chipTick, setChipTick] = useState({ V: 0, E: 0, P: 0 })
   const [chipDelta, setChipDelta] = useState({ V: 0, E: 0, P: 0 }) // -1 down, 0 same, +1 up
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light')
-    const themeColorMeta = document.getElementById('themeColorMeta') as HTMLMetaElement
+    const themeColorMeta = document.getElementById('theme-color') as HTMLMetaElement
     if (themeColorMeta) themeColorMeta.content = dark ? '#0e1117' : '#ffffff'
   }, [dark])
 
-  async function refreshStats() {
+  const refreshStats = useCallback(async () => {
     try {
       const r = await graphRef.current?.getInfo()
       if (r) {
@@ -57,22 +49,13 @@ export default function App() {
 
         setStats(r)
         if (goToM > r.V) setGoToM(r.V || 1)
-        
-        // Update layout quality
-        const quality = graphRef.current?.getLayoutQuality() || 0
-        setLayoutQuality(quality)
       }
     } catch (error) {
       console.error('Error refreshing stats:', error)
     }
-  }
+  }, [stats.V, stats.E, stats.periphery, goToM])
 
-  function showHud(message: string) {
-    // Simple HUD display - you can enhance this with a proper HUD component
-    console.log(`HUD: ${message}`)
-  }
-
-  useEffect(() => { refreshStats() }, [])
+  useEffect(() => { refreshStats() }, [refreshStats])
 
   const afterAction = (delay = 60) => window.setTimeout(refreshStats, delay)
 
@@ -268,6 +251,14 @@ export default function App() {
               Redraw (Planar)
             </button>
 
+            <button
+              className="btn"
+              onClick={() => { graphRef.current?.tutteNow(); afterAction() }}
+              aria-label="Apply Tutte embedding to graph"
+            >
+              Tutte Re-Embed Now
+            </button>
+
             <label className="switch-line">
               <input
                 type="checkbox"
@@ -281,110 +272,6 @@ export default function App() {
               />
               <span>Auto Tutte Re-Embed (on add)</span>
             </label>
-          </div>
-        </details>
-
-        {/* ADVANCED LAYOUT */}
-        <details className="card" aria-expanded="false">
-          <summary role="button" aria-controls="advanced-layout-section" tabIndex={0}>Advanced Layout</summary>
-          <div id="advanced-layout-section">
-            <div className="row">
-              <div className="label">Layout Quality</div>
-              <div className={`chip ${layoutQuality > 80 ? 'up' : layoutQuality > 60 ? '' : 'down'}`}>
-                {layoutQuality.toFixed(0)}%
-              </div>
-            </div>
-
-            <label className="switch-line">
-              <input
-                type="checkbox"
-                checked={useSpatialIndexing}
-                onChange={e => {
-                  const on = e.target.checked
-                  setUseSpatialIndexing(on)
-                  graphRef.current?.setLayoutConfig({ useSpatialIndexing: on })
-                }}
-                aria-label="Toggle spatial indexing for performance"
-              />
-              <span>Spatial Indexing (Performance)</span>
-            </label>
-
-            <div className="label">Spring Strength (K)</div>
-            <input
-              className="slider"
-              type="range" min={0} max={100}
-              value={Math.round(springK * 500)}
-              onChange={e => {
-                const k = parseInt(e.target.value || '0', 10) / 500
-                setSpringK(k)
-                graphRef.current?.setLayoutConfig({ springK: k })
-              }}
-              aria-label="Adjust spring force strength"
-            />
-
-            <div className="label">Repulsion Strength</div>
-            <input
-              className="slider"
-              type="range" min={0} max={100}
-              value={Math.round(repulsionStrength * 400)}
-              onChange={e => {
-                const r = parseInt(e.target.value || '0', 10) / 400
-                setRepulsionStrength(r)
-                graphRef.current?.setLayoutConfig({ repulsionStrength: r })
-              }}
-              aria-label="Adjust repulsion force strength"
-            />
-
-            <label className="switch-line">
-              <input
-                type="checkbox"
-                checked={magneticForces}
-                onChange={e => {
-                  const on = e.target.checked
-                  setMagneticForces(on)
-                  graphRef.current?.setLayoutConfig({ magneticForces: on })
-                }}
-                aria-label="Toggle magnetic forces to center"
-              />
-              <span>Magnetic Forces (Center Attraction)</span>
-            </label>
-
-            <label className="switch-line">
-              <input
-                type="checkbox"
-                checked={adaptiveForces}
-                onChange={e => {
-                  const on = e.target.checked
-                  setAdaptiveForces(on)
-                  graphRef.current?.setLayoutConfig({ adaptiveForces: on })
-                }}
-                aria-label="Toggle adaptive force scaling"
-              />
-              <span>Adaptive Force Scaling</span>
-            </label>
-
-            <div className="row">
-              <button
-                className="btn"
-                onClick={() => {
-                  const quality = graphRef.current?.getLayoutQuality() || 0
-                  setLayoutQuality(quality)
-                }}
-                aria-label="Calculate current layout quality"
-              >
-                Calculate Quality
-              </button>
-              <button
-                className="btn"
-                onClick={() => {
-                  graphRef.current?.calculateForces()
-                  showHud('Forces recalculated')
-                }}
-                aria-label="Recalculate layout forces"
-              >
-                Recalculate Forces
-              </button>
-            </div>
           </div>
         </details>
 
@@ -512,14 +399,6 @@ export default function App() {
           Tips: Right‑click canvas to cancel selection. Hotkeys: N/S new • R random • A select •
           D redraw • E Tutte • L declutter • T labels • C center • G go • +/- zoom
         </div>
-        
-        {/* Performance Monitor */}
-        <PerformanceMonitor 
-          graphRef={graphRef}
-          onMetricsUpdate={(metrics) => {
-            setLayoutQuality(metrics.layoutQuality)
-          }}
-        />
       </aside>
     </div>
   )

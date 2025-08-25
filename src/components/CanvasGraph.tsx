@@ -1,16 +1,18 @@
-import React, { useEffect, useImperativeHandle, useRef, useState } from 'react'
-import { Graph, type AdvancedLayoutConfig } from '../engine/Graph'
+import React, { useEffect, useImperativeHandle, useRef, useState, useCallback } from 'react'
+import { Graph } from '../engine/Graph'
 import { v_lerp } from '../engine/geom'
 import TextType from '../TextType'
+import type { GState } from '../types'
 
 export type CanvasGraphHandle = {
   startGraph: (n: number) => void
   saveJsonAs: (filename?: string) => Promise<void>
-  loadJsonObject: (obj: any) => Promise<void>
+  loadJsonObject: (obj: GState) => Promise<void>
   exportPng: (filename?: string) => Promise<void>
   addRandom: () => void
   beginSelect: () => void
   redrawPlanar: () => void
+  tutteNow: () => void
   getInfo: () => Promise<{ V: number, E: number, periphery: number }>
   declutterView: () => void
   center: () => void
@@ -24,19 +26,14 @@ export type CanvasGraphHandle = {
   setShrinkGamma: (g: number) => void
   setSelectionMode: (mode: 'visual' | 'program') => void
   goTo: (m: number) => void
-  // New advanced methods
-  setLayoutConfig: (config: Partial<AdvancedLayoutConfig>) => void
-  getLayoutConfig: () => AdvancedLayoutConfig
-  calculateForces: () => void
-  getLayoutQuality: () => number
 }
 
-type Props = {}
+type Props = Record<string, never>
 type Pt = { x: number, y: number }
 
 const NEW_GRAPH_ANIM_MS = 600
 
-export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: Props, ref: React.ForwardedRef<CanvasGraphHandle>) => {
+export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [graph] = useState(() => new Graph())
 
@@ -84,7 +81,194 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
     hudTimer.current = window.setTimeout(() => setHud(''), ms)
   }
 
-  function zoomBy(f: number) {
+  const draw = useCallback(() => {
+    try {
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const ctx = canvas.getContext('2d'); if (!ctx) return
+      
+      const dpr = window.devicePixelRatio || 1
+      const w = canvas.clientWidth || 300, h = canvas.clientHeight || 150
+      if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+        canvas.width = w * dpr; canvas.height = h * dpr
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      }
+      ctx.clearRect(0, 0, w, h)
+
+      drawGrid(ctx, w, h)
+    } catch {
+      // Silently continue if drawing setup fails
+      return
+    }
+
+    let peri: number[] = []
+    let nPer = 0
+    let orientCCW = true
+
+    try {
+      const canvas = canvasRef.current; if (!canvas) return
+      const ctx = canvas.getContext('2d'); if (!ctx) return
+      
+      const edgeColor = getComputedStyle(canvas).getPropertyValue('--edge-color').trim() || '#3c3c3c'
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round'
+      const scale = cam.current?.scale || 1
+      const verticesLength = Array.isArray(graph?.vertices) ? graph.vertices.length : 0
+      const edgeWidth = Math.max(0.25, 2.0 / (1.0 + 0.9 * scale + 0.00012 * verticesLength))
+      ctx.strokeStyle = edgeColor; ctx.lineWidth = edgeWidth
+
+      peri = graph.periphery?.getIndices?.() ?? []
+      nPer = peri.length
+      try {
+        let A = 0
+        for (let i = 0; i < nPer; i++) {
+          const aV = graph?.vertices?.[peri[i]]
+          const bV = graph?.vertices?.[peri[(i + 1) % nPer]]
+          if (!aV || !bV) continue
+          const a = aV.getPosition(), b = bV.getPosition()
+          A += a.x * b.y - b.x * a.y
+        }
+        orientCCW = A > 0
+      } catch {
+        orientCCW = true
+      }
+    } catch {
+      // Silently continue if edge setup fails
+      return
+    }
+
+    // Edges
+    try {
+      const canvas = canvasRef.current; if (!canvas) return
+      const ctx = canvas.getContext('2d'); if (!ctx) return
+      const w = canvas.clientWidth || 300, h = canvas.clientHeight || 150
+      ctx.beginPath()
+      for (const e of graph.edges || []) {
+        try {
+          if (!e || e.visible === false) continue
+          if (!graph?.vertices?.[e.u] || !graph?.vertices?.[e.v]) continue
+          const p1 = graph.vertices[e.u].getPosition()
+          const p2 = graph.vertices[e.v].getPosition()
+          if (!p1 || !p2) continue
+          const iu = peri.indexOf(e.u)
+          let isPeriEdge = false
+          if (nPer >= 2 && iu >= 0) {
+            isPeriEdge = (peri[(iu + 1) % nPer] === e.v) || (peri[(iu - 1 + nPer) % nPer] === e.v)
+          }
+          if (isPeriEdge && curvedRef.current) {
+            const nextOfU = peri[(iu + 1) % nPer], isUvOrder = (nextOfU === e.v)
+            const p1d = isUvOrder ? p1 : p2, p2d = isUvOrder ? p2 : p1
+            const s1 = worldToScreen(p1d.x, p1d.y), s2 = worldToScreen(p2d.x, p2d.y)
+            const dx = s2.x - s1.x, dy = s2.y - s1.y, L = Math.hypot(dx, dy) || 1
+            const mx = (s1.x + s2.x) / 2, my = (s1.y + s2.y) / 2
+            let nx = orientCCW ? (dy / L) : (-dy / L), ny = orientCCW ? (-dx / L) : (dx / L)
+            const c = graph.get_center?.() ?? { x: 0, y: 0 }, sc = worldToScreen(c.x, c.y)
+            if (nx * (mx - sc.x) + ny * (my - sc.y) < 0) { nx = -nx; ny = -ny }
+            const viewMin = Math.min(w, h)
+            let sagPx = L * 0.07
+            if (L > 0.6 * viewMin) sagPx *= 0.75
+            if (L > 0.9 * viewMin) sagPx *= 0.65
+            sagPx = Math.min(sagPx, 0.12 * viewMin)
+            const cx = mx + nx * (2 * sagPx), cy = my + ny * (2 * sagPx)
+            ctx.moveTo(s1.x, s1.y); ctx.quadraticCurveTo(cx, cy, s2.x, s2.y)
+          } else {
+            const s1 = worldToScreen(p1.x, p1.y), s2 = worldToScreen(p2.x, p2.y)
+            ctx.moveTo(s1.x, s1.y); ctx.lineTo(s2.x, s2.y)
+          }
+        } catch {
+          // Silently continue if individual edge rendering fails
+          continue
+        }
+      }
+      ctx.stroke()
+    } catch {
+      // Silently continue if edge rendering fails
+      return
+    }
+
+    // Vertices
+    try {
+      const canvas = canvasRef.current; if (!canvas) return
+      const ctx = canvas.getContext('2d'); if (!ctx) return
+      const labelMode = graph.get_label_mode() ?? 0
+      const paletteOutline = ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f']
+      const paletteFill = ['#ff6b6b', '#48dbfb', '#1dd1a1', '#feca57']
+      for (const v of graph.vertices || []) {
+        try {
+          if (!v || typeof v.isVisible !== 'function' || !v.isVisible()) continue
+          const p = v.getPosition(); if (!p) continue
+          const s = worldToScreen(p.x, p.y)
+          const baseD = typeof v.getDiameter === 'function' ? v.getDiameter() : 30
+          const scale = cam.current?.scale || 1
+          const gamma = shrinkOnZoom.current ? Math.max(1.0, Math.min(2.0, shrinkGamma.current || 1.0)) : 1.0
+          const nodePx = Math.max(6, Math.min(44, (baseD * scale) / Math.max(Math.pow(scale, gamma), 1)))
+          const d = nodePx
+          const colorIdx = (typeof v.getColorIndex === 'function' ? v.getColorIndex() : 1) - 1
+          const colorIdxSafe = ((colorIdx % 4) + 4) % 4
+          const fill = labelMode === 1 ? '#ffffff' : paletteFill[colorIdxSafe]
+          const stroke = labelMode === 1 ? '#000000' : paletteOutline[colorIdxSafe]
+          const ctx2 = ctx
+          ctx2.fillStyle = fill; ctx2.strokeStyle = stroke; ctx2.lineWidth = 2
+          ctx2.beginPath(); ctx2.arc(s.x, s.y, d / 2, 0, Math.PI * 2); ctx2.fill(); ctx2.stroke()
+          if (labelMode === 1 || labelMode === 2) {
+            try {
+              ctx2.fillStyle = '#000000'
+              ctx2.font = `${Math.max(1, Math.round(0.6 * d))}px Arial`
+              ctx2.textAlign = 'center'; ctx2.textBaseline = 'middle'
+              const index = typeof v.getIndex === 'function' ? v.getIndex() : 0
+              ctx2.fillText(String(index + 1), s.x, s.y)
+            } catch {
+              // Silently continue if text rendering fails
+            }
+          }
+        } catch {
+          // Silently continue if individual vertex rendering fails
+          continue
+        }
+      }
+    } catch {
+      // Silently continue if vertex rendering fails
+    }
+  }, [graph, cam, curvedRef, shrinkOnZoom, shrinkGamma, worldToScreen, drawGrid])
+
+  const center = useCallback((animMs = 0) => {
+    const [minx, miny, maxx, maxy] = graph.get_bounding_box()
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const w = canvas.clientWidth || canvas.width
+    const h = canvas.clientHeight || canvas.height
+    const pw = maxx - minx, ph = maxy - miny
+    if (w < 2 || h < 2 || pw < 1e-6 || ph < 1e-6) return
+
+    const basePadPx = Math.max(40, Math.min(80, Math.min(w, h) * 0.06))
+    const s1 = Math.min((w - 2 * basePadPx) / pw, (h - 2 * basePadPx) / ph)
+    const extraPadPx = curvedRef.current ? maxPeripherySagPx(s1, w, h) : 0
+    const padPx = basePadPx + extraPadPx
+    const targetScale = Math.min((w - 2 * padPx) / pw, (h - 2 * padPx) / ph)
+    const targetX = (minx + maxx) / 2 - w / (2 * targetScale)
+    const targetY = (miny + maxy) / 2 - h / (2 * targetScale)
+
+    if (!animMs) {
+      cam.current = { x: targetX, y: targetY, scale: targetScale }
+      draw()
+      return
+    }
+    const a0 = { ...cam.current }, a1 = { x: targetX, y: targetY, scale: targetScale }
+    const t0 = performance.now()
+    const stepCam = (now: number) => {
+      const t = Math.min(1, (now - t0) / animMs)
+      cam.current = {
+        x: a0.x + (a1.x - a0.x) * t,
+        y: a0.y + (a1.y - a0.y) * t,
+        scale: a0.scale + (a1.scale - a0.scale) * t,
+      }
+      draw()
+      if (t < 1) requestAnimationFrame(stepCam)
+    }
+    requestAnimationFrame(stepCam)
+  }, [graph, curvedRef, draw, maxPeripherySagPx])
+
+  const zoomBy = useCallback((f: number) => {
     const canvas = canvasRef.current
     if (!canvas) return
     const MIN_SCALE = 1e-4, MAX_SCALE = 1e6
@@ -96,7 +280,7 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
     cam.current.x += (before.x - after.x)
     cam.current.y += (before.y - after.y)
     draw()
-  }
+  }, [cam, screenToWorld, draw])
 
   useEffect(() => {
     curvedRef.current = curvedPeriphery
@@ -120,14 +304,13 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
       if (hudTimer.current) window.clearTimeout(hudTimer.current)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [center, draw])
 
   useEffect(() => {
     const onResize = () => { if (!animRef.current && !isDown.current && !dragging.current) center(0) }
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [center])
 
   // Keyboard navigation
   useEffect(() => {
@@ -171,12 +354,12 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
 
     canvas.addEventListener('keydown', handleKeyDown)
     return () => canvas.removeEventListener('keydown', handleKeyDown)
-  }, [])
+  }, [draw, zoomBy, center])
 
   // Fallback declutter helpers
   function buildAdj(): Map<number, Set<number>> {
     const adj = new Map<number, Set<number>>()
-    const edges: any[] = (graph as any).edges || []
+    const edges = graph.edges || []
     for (const e of edges) {
       const u = e.u, v = e.v
       if (!adj.has(u)) adj.set(u, new Set())
@@ -186,7 +369,7 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
     return adj
   }
   function fallbackDeclutter(rounds = 2) {
-    const per = (graph as any).periphery?.getIndices?.() || []
+    const per = graph.periphery?.getIndices?.() || []
     const perSet = new Set<number>(per)
     const adj = buildAdj()
     for (let r = 0; r < rounds; r++) {
@@ -235,7 +418,7 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
       showHud('Saved graph.json')
     },
 
-    async loadJsonObject(obj: any) {
+    async loadJsonObject(obj: GState) {
       hideIntro(300)
       await graph.loadFromJsonObject(obj)
       center(0); draw(); showHud('Graph loaded')
@@ -258,14 +441,10 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
     addRandom() {
       void (async () => {
         if (finalizeRef.current) return
-        await waitForIdle() // don't ignore clicks during animation
+        await waitForIdle() // don’t ignore clicks during animation
         const pre = snapshot()
-        const [ok, , errorReason] = await graph.addRandomVertex()
-        if (!ok) { 
-          const warningMsg = errorReason || 'No valid periphery arc found'
-          showHud(`⚠️ ${warningMsg}`, 4000)
-          return 
-        }
+        const [ok] = await graph.addRandomVertex()
+        if (!ok) { showHud('No valid periphery arc'); return }
         const post = snapshot()
         const info = graph.lastAddInfo
         if (info && info.spawn_pos && pre[info.index] === undefined) pre[info.index] = info.spawn_pos
@@ -288,12 +467,21 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
       })
     },
 
+    tutteNow() {
+      const pre = snapshot()
+      void graph.reembedTutte(true).then(() => {
+        const post = snapshot()
+        animate(pre, post, 420)
+        showHud('Tutte re-embed done')
+      })
+    },
+
     async getInfo() {
       try {
-        const s = (graph as any).getStats?.() || {
+        const s = graph.getStats?.() || {
           total_vertices: graph.vertices?.length || 0,
-          edges: (graph as any).edges?.length ?? 0,
-          periphery_size: (graph as any).periphery?.getIndices?.().length ?? 0
+          edges: graph.edges?.length ?? 0,
+          periphery_size: graph.periphery?.getIndices?.().length ?? 0
         }
         const V = s.total_vertices || 0
         const E = s.edges || 0
@@ -312,10 +500,10 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
       const pre = snapshot()
       void (async () => {
         let changed = false
-        if (typeof (graph as any).declutterView === 'function') {
-          changed = await (graph as any).declutterView()
-        } else if (typeof (graph as any).reembedTutte === 'function') {
-          await (graph as any).reembedTutte(true)
+        if (typeof graph.declutterView === 'function') {
+          changed = await graph.declutterView()
+        } else if (typeof graph.reembedTutte === 'function') {
+          await graph.reembedTutte(true)
           changed = true
         } else {
           fallbackDeclutter(2)
@@ -333,7 +521,7 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
 
     toggleLabels() {
       const next = (graph.get_label_mode() + 1) % 3
-      graph.setLabelMode(next as any)
+      graph.setLabelMode(next as 0 | 1 | 2)
       draw()
       showHud('Toggled labels')
     },
@@ -358,7 +546,7 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
           await graph.goToVertex(4)
           showHud('Finalize: ON (G4)')
         } else {
-          const total = (graph as any).getStats?.().total_vertices ?? graph.vertices.length
+          const total = graph.getStats?.().total_vertices ?? graph.vertices.length
           await graph.goToVertex(total)
           showHud('Finalize: OFF')
         }
@@ -376,25 +564,9 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
         showHud(`Showing 1..${Math.max(1, Math.floor(m))}`)
       })
     },
-
-    // New advanced methods
-    setLayoutConfig(config: Partial<AdvancedLayoutConfig>) {
-      void graph.setLayoutConfig(config)
-      showHud('Layout config updated')
-    },
-    getLayoutConfig() {
-      return graph.getLayoutConfig()
-    },
-    calculateForces() {
-      void graph.calculateForces()
-      showHud('Forces calculated')
-    },
-    getLayoutQuality() {
-      return graph.getLastLayoutQuality()
-    }
   }))
 
-  useEffect(() => { center(0) }, [curvedPeriphery])
+  useEffect(() => { center(0) }, [curvedPeriphery, center])
 
   function snapshot() {
     const snap: Record<number, Pt> = {}
@@ -403,7 +575,7 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
   }
 
   function animateSpawnFromCenter(post: Record<number, Pt>, spawnRatio = 0.08, duration = NEW_GRAPH_ANIM_MS) {
-    const c = (graph as any).get_center?.() ?? { x: 0, y: 0 }
+    const c = graph.get_center?.() ?? { x: 0, y: 0 }
     const pre: Record<number, Pt> = {}
     for (const kStr of Object.keys(post)) {
       const k = Number(kStr)
@@ -439,45 +611,7 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
   }
 
   // Fit + rendering
-  function center(animMs = 0) {
-    const [minx, miny, maxx, maxy] = graph.get_bounding_box()
-    const canvas = canvasRef.current
-    if (!canvas) return
-
-    const w = canvas.clientWidth || canvas.width
-    const h = canvas.clientHeight || canvas.height
-    const pw = maxx - minx, ph = maxy - miny
-    if (w < 2 || h < 2 || pw < 1e-6 || ph < 1e-6) return
-
-    const basePadPx = Math.max(40, Math.min(80, Math.min(w, h) * 0.06))
-    const s1 = Math.min((w - 2 * basePadPx) / pw, (h - 2 * basePadPx) / ph)
-    const extraPadPx = curvedRef.current ? maxPeripherySagPx(s1, w, h) : 0
-    const padPx = basePadPx + extraPadPx
-    const targetScale = Math.min((w - 2 * padPx) / pw, (h - 2 * padPx) / ph)
-    const targetX = (minx + maxx) / 2 - w / (2 * targetScale)
-    const targetY = (miny + maxy) / 2 - h / (2 * targetScale)
-
-    if (!animMs) {
-      cam.current = { x: targetX, y: targetY, scale: targetScale }
-      draw()
-      return
-    }
-    const a0 = { ...cam.current }, a1 = { x: targetX, y: targetY, scale: targetScale }
-    const t0 = performance.now()
-    const stepCam = (now: number) => {
-      const t = Math.min(1, (now - t0) / animMs)
-      cam.current = {
-        x: a0.x + (a1.x - a0.x) * t,
-        y: a0.y + (a1.y - a0.y) * t,
-        scale: a0.scale + (a1.scale - a0.scale) * t,
-      }
-      draw()
-      if (t < 1) requestAnimationFrame(stepCam)
-    }
-    requestAnimationFrame(stepCam)
-  }
-
-  function maxPeripherySagPx(scaleEstimate: number, w: number, h: number): number {
+  const maxPeripherySagPx = useCallback((scaleEstimate: number, w: number, h: number): number => {
     const peri = graph.periphery.getIndices()
     if (peri.length < 2) return 0
     const viewMin = Math.min(w, h)
@@ -494,9 +628,9 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
       if (sagPx > maxSag) maxSag = sagPx
     }
     return Math.max(12, maxSag * 1.15)
-  }
+  }, [graph])
 
-  function worldToScreen(x: number, y: number) {
+  const worldToScreen = useCallback((x: number, y: number) => {
     try {
       const { scale, x: ox, y: oy } = cam.current || { scale: 1, x: 0, y: 0 }
       const validScale = Math.max(1e-9, scale)
@@ -505,9 +639,9 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
       console.error('Error in worldToScreen:', error)
       return { x: 0, y: 0 }
     }
-  }
+  }, [cam])
   
-  function screenToWorld(x: number, y: number) {
+  const screenToWorld = useCallback((x: number, y: number) => {
     try {
       const { scale, x: ox, y: oy } = cam.current || { scale: 1, x: 0, y: 0 }
       const validScale = Math.max(1e-9, scale)
@@ -516,16 +650,16 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
       console.error('Error in screenToWorld:', error)
       return { x: 0, y: 0 }
     }
-  }
+  }, [cam])
 
   function angleUp(p: Pt, c: Pt) { return Math.atan2(-(p.y - c.y), (p.x - c.x)) }
   function dtheta(a: number, b: number) {
     let d = a - b; while (d <= -Math.PI) d += 2 * Math.PI; while (d > Math.PI) d -= 2 * Math.PI; return d
   }
   function visualCwIsStoredNext(vp: number): boolean {
-    const [prev, next] = (graph as any).periphery?.neighborsOnPeriphery?.(vp) ?? [null, null]
+    const [prev, next] = graph.periphery?.neighborsOnPeriphery?.(vp) ?? [null, null]
     if (prev == null || next == null) return true
-    const c = (graph as any).get_center?.() ?? { x: 0, y: 0 }
+    const c = graph.get_center?.() ?? { x: 0, y: 0 }
     const pv = graph.vertices[vp].getPosition()
     const pn = graph.vertices[next].getPosition()
     const tv = angleUp(pv, c), tn = angleUp(pn, c)
@@ -536,7 +670,7 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
   }
 
   // Grid rendering
-  function drawGrid(ctx: CanvasRenderingContext2D, w: number, h: number) {
+  const drawGrid = useCallback((ctx: CanvasRenderingContext2D, w: number, h: number) => {
     if (!gridRef.current) return
     const canvas = canvasRef.current
     if (!canvas) return
@@ -583,147 +717,7 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
       ctx.strokeStyle = (count % 5 === 0) ? major : minor
       ctx.stroke()
     }
-  }
-
-  function draw() {
-    try {
-      const canvas = canvasRef.current
-      if (!canvas) return
-      const ctx = canvas.getContext('2d'); if (!ctx) return
-      
-      const dpr = window.devicePixelRatio || 1
-      const w = canvas.clientWidth || 300, h = canvas.clientHeight || 150
-      if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-        canvas.width = w * dpr; canvas.height = h * dpr
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-      }
-      ctx.clearRect(0, 0, w, h)
-
-      drawGrid(ctx, w, h)
-    } catch {
-      return
-    }
-
-    let peri: number[] = []
-    let nPer = 0
-    let orientCCW = true
-
-    try {
-      const canvas = canvasRef.current; if (!canvas) return
-      const ctx = canvas.getContext('2d'); if (!ctx) return
-      
-      const edgeColor = getComputedStyle(canvas).getPropertyValue('--edge-color').trim() || '#3c3c3c'
-      ctx.lineCap = 'round'; ctx.lineJoin = 'round'
-      const scale = cam.current?.scale || 1
-      const verticesLength = Array.isArray(graph?.vertices) ? graph.vertices.length : 0
-      const edgeWidth = Math.max(0.25, 2.0 / (1.0 + 0.9 * scale + 0.00012 * verticesLength))
-      ctx.strokeStyle = edgeColor; ctx.lineWidth = edgeWidth
-
-      peri = (graph as any).periphery?.getIndices?.() ?? []
-      nPer = peri.length
-      try {
-        let A = 0
-        for (let i = 0; i < nPer; i++) {
-          const aV = graph?.vertices?.[peri[i]]
-          const bV = graph?.vertices?.[peri[(i + 1) % nPer]]
-          if (!aV || !bV) continue
-          const a = aV.getPosition(), b = bV.getPosition()
-          A += a.x * b.y - b.x * a.y
-        }
-        orientCCW = A > 0
-      } catch {
-        orientCCW = true
-      }
-    } catch {
-      return
-    }
-
-    // Edges
-    try {
-      const canvas = canvasRef.current; if (!canvas) return
-      const ctx = canvas.getContext('2d'); if (!ctx) return
-      const w = canvas.clientWidth || 300, h = canvas.clientHeight || 150
-      ctx.beginPath()
-      for (const e of (graph as any).edges || []) {
-        try {
-          if (!e || e.visible === false) continue
-          if (!graph?.vertices?.[e.u] || !graph?.vertices?.[e.v]) continue
-          const p1 = graph.vertices[e.u].getPosition()
-          const p2 = graph.vertices[e.v].getPosition()
-          if (!p1 || !p2) continue
-          const iu = peri.indexOf(e.u)
-          let isPeriEdge = false
-          if (nPer >= 2 && iu >= 0) {
-            isPeriEdge = (peri[(iu + 1) % nPer] === e.v) || (peri[(iu - 1 + nPer) % nPer] === e.v)
-          }
-          if (isPeriEdge && curvedRef.current) {
-            const nextOfU = peri[(iu + 1) % nPer], isUvOrder = (nextOfU === e.v)
-            const p1d = isUvOrder ? p1 : p2, p2d = isUvOrder ? p2 : p1
-            const s1 = worldToScreen(p1d.x, p1d.y), s2 = worldToScreen(p2d.x, p2d.y)
-            const dx = s2.x - s1.x, dy = s2.y - s1.y, L = Math.hypot(dx, dy) || 1
-            const mx = (s1.x + s2.x) / 2, my = (s1.y + s2.y) / 2
-            let nx = orientCCW ? (dy / L) : (-dy / L), ny = orientCCW ? (-dx / L) : (dx / L)
-            const c = (graph as any).get_center?.() ?? { x: 0, y: 0 }, sc = worldToScreen(c.x, c.y)
-            if (nx * (mx - sc.x) + ny * (my - sc.y) < 0) { nx = -nx; ny = -ny }
-            const viewMin = Math.min(w, h)
-            let sagPx = L * 0.07
-            if (L > 0.6 * viewMin) sagPx *= 0.75
-            if (L > 0.9 * viewMin) sagPx *= 0.65
-            sagPx = Math.min(sagPx, 0.12 * viewMin)
-            const cx = mx + nx * (2 * sagPx), cy = my + ny * (2 * sagPx)
-            ctx.moveTo(s1.x, s1.y); ctx.quadraticCurveTo(cx, cy, s2.x, s2.y)
-          } else {
-            const s1 = worldToScreen(p1.x, p1.y), s2 = worldToScreen(p2.x, p2.y)
-            ctx.moveTo(s1.x, s1.y); ctx.lineTo(s2.x, s2.y)
-          }
-        } catch {
-          continue
-        }
-      }
-      ctx.stroke()
-    } catch {
-      return
-    }
-
-    // Vertices
-    try {
-      const canvas = canvasRef.current; if (!canvas) return
-      const ctx = canvas.getContext('2d'); if (!ctx) return
-      const labelMode = graph.get_label_mode() ?? 0
-      const paletteOutline = ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f']
-      const paletteFill = ['#ff6b6b', '#48dbfb', '#1dd1a1', '#feca57']
-      for (const v of graph.vertices || []) {
-        try {
-          if (!v || typeof v.isVisible !== 'function' || !v.isVisible()) continue
-          const p = v.getPosition(); if (!p) continue
-          const s = worldToScreen(p.x, p.y)
-          const baseD = typeof v.getDiameter === 'function' ? v.getDiameter() : 30
-          const scale = cam.current?.scale || 1
-          const gamma = shrinkOnZoom.current ? Math.max(1.0, Math.min(2.0, shrinkGamma.current || 1.0)) : 1.0
-          const nodePx = Math.max(6, Math.min(44, (baseD * scale) / Math.max(Math.pow(scale, gamma), 1)))
-          const d = nodePx
-          const colorIdx = (typeof v.getColorIndex === 'function' ? v.getColorIndex() : 1) - 1
-          const colorIdxSafe = ((colorIdx % 4) + 4) % 4
-          const fill = labelMode === 1 ? '#ffffff' : paletteFill[colorIdxSafe]
-          const stroke = labelMode === 1 ? '#000000' : paletteOutline[colorIdxSafe]
-          const ctx2 = ctx
-          ctx2.fillStyle = fill; ctx2.strokeStyle = stroke; ctx2.lineWidth = 2
-          ctx2.beginPath(); ctx2.arc(s.x, s.y, d / 2, 0, Math.PI * 2); ctx2.fill(); ctx2.stroke()
-          if (labelMode === 1 || labelMode === 2) {
-            try {
-              ctx2.fillStyle = '#000000'
-              ctx2.font = `${Math.max(1, Math.round(0.6 * d))}px Arial`
-              ctx2.textAlign = 'center'; ctx2.textBaseline = 'middle'
-              const index = typeof v.getIndex === 'function' ? v.getIndex() : 0
-              ctx2.fillText(String(index + 1), s.x, s.y)
-            } catch {}
-          }
-        } catch {
-          continue
-        }
-      }
-    } catch {}
-  }
+  }, [gridRef, cam])
 
   // Events
   useEffect(() => {
@@ -775,15 +769,12 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
           if (vq !== null) {
             const [a, b] = mapSelectionToProgramCw(selecting.current.vp, vq)
             void (async () => {
-              const [ok, , errorReason] = await graph.addVertexBySelection(a, b)
+              const [ok] = await graph.addVertexBySelection(a, b)
               if (ok) {
                 const post = snapshot()
                 const info = graph.lastAddInfo
                 if (info && info.spawn_pos && pre[info.index] === undefined) pre[info.index] = info.spawn_pos
                 animate(pre, post, 420)
-              } else {
-                const warningMsg = errorReason || 'Failed to add vertex by selection'
-                showHud(`⚠️ ${warningMsg}`, 4000)
               }
             })()
           }
@@ -857,15 +848,12 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
           if (vq !== null) {
             const [a, b] = mapSelectionToProgramCw(selecting.current.vp, vq)
             void (async () => {
-              const [ok, , errorReason] = await graph.addVertexBySelection(a, b)
+              const [ok] = await graph.addVertexBySelection(a, b)
               if (ok) {
                 const post = snapshot()
                 const info = graph.lastAddInfo
                 if (info && info.spawn_pos && pre[info.index] === undefined) pre[info.index] = info.spawn_pos
                 animate(pre, post, 420)
-              } else {
-                const warningMsg = errorReason || 'Failed to add vertex by selection'
-                showHud(`⚠️ ${warningMsg}`, 4000)
               }
             })()
           }
@@ -903,12 +891,12 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
     try {
       if (!graph?.vertices?.length) return null
       const p = screenToWorld(offsetX, offsetY)
-      const perSet = new Set((graph as any).periphery?.getIndices?.() ?? [])
+      const perSet = new Set(graph.periphery?.getIndices?.() ?? [])
       const scale = Math.max(1e-9, cam.current?.scale || 1)
       const gamma = shrinkOnZoom.current ? Math.max(1.0, Math.min(2.0, shrinkGamma.current || 1.0)) : 1.0
 
       for (let i = graph.vertices.length - 1; i >= 0; i--) {
-        const gv = graph.vertices[i] as any
+        const gv = graph.vertices[i]
         if (!gv) continue
         try {
           const pos = gv.getPosition()
@@ -919,17 +907,20 @@ export const CanvasGraph = React.forwardRef<CanvasGraphHandle, Props>((_props: P
           const dx = pos.x - p.x, dy = pos.y - p.y
           if (Math.hypot(dx, dy) <= rWorld) return i
         } catch {
+          // Silently continue if individual vertex processing fails
           continue
         }
       }
-    } catch {}
+    } catch {
+      // Silently continue if vertex finding fails
+    }
     return null
   }
 
   const getAccessibleDescription = () => {
     const vertexCount = graph.vertices.length;
-    const edgeCount = (graph as any).edges?.length || 0;
-    const peripheryCount = (graph as any).periphery?.getIndices?.().length || 0;
+    const edgeCount = graph.edges?.length || 0;
+    const peripheryCount = graph.periphery?.getIndices?.().length || 0;
     return `Graph with ${vertexCount} vertices and ${edgeCount} edges. ${peripheryCount} vertices on periphery. ${selecting.current.vp !== null ? 'Currently in selection mode.' : ''}`;
   };
 

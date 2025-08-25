@@ -46,18 +46,6 @@ self.onmessage = async (e) => {
         reply({ ok: true, data: await pyodide.runPythonAsync(`bridge.set_label_mode(${payload.mode})`) }); break;
       case "declutter":
         reply({ ok: true, data: await pyodide.runPythonAsync(`bridge.declutter(${payload?.intensity ?? 1.0})`) }); break;
-      
-      // New advanced layout commands
-      case "set_layout_config":
-        pyodide.globals.set("___config", payload.config);
-        reply({ ok: true, data: await pyodide.runPythonAsync("bridge.set_layout_config(___config)") }); break;
-      case "get_layout_config":
-        reply({ ok: true, data: await pyodide.runPythonAsync("bridge.get_layout_config()") }); break;
-      case "calculate_layout_quality":
-        reply({ ok: true, data: await pyodide.runPythonAsync("bridge.calculate_layout_quality()") }); break;
-      case "recalculate_forces":
-        reply({ ok: true, data: await pyodide.runPythonAsync("bridge.recalculate_forces()") }); break;
-      
       default:
         reply({ ok: false, error: `Unknown cmd ${cmd}` });
     }
